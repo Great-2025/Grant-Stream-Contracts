@@ -21,6 +21,14 @@ const MAX_STAKE_PERCENTAGE: i128 = 5000; // 50% maximum stake (in basis points)
 const MIN_SECURITY_DEPOSIT_PERCENTAGE: i128 = 500; // 5% minimum security deposit
 const MAX_SECURITY_DEPOSIT_PERCENTAGE: i128 = 2000; // 20% maximum security deposit
 
+// Tax Jurisdiction constants
+const MAX_JURISDICTION_CODE_LENGTH: u32 = 10; // Maximum jurisdiction code length (e.g., "US-CA", "GB-LDN")
+const DEFAULT_TAX_WITHHOLDING_RATE: u32 = 0; // 0% default withholding rate (in basis points)
+const MAX_TAX_WITHHOLDING_RATE: u32 = 5000; // 50% maximum withholding rate (in basis points)
+
+// Legal Entity Monitor constants
+const ENTITY_STATUS_CACHE_DURATION: u64 = 24 * 60 * 60; // 24 hours cache duration
+
 // Financial Snapshot constants
 const SNAPSHOT_VERSION: u32 = 1; // Version for future compatibility
 const SNAPSHOT_EXPIRY: u64 = 86400; // 24 hours in seconds
@@ -292,6 +300,33 @@ pub enum StreamType {
     TimeLockedLease,  // NEW: Lease stream to lessor address
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum LegalEntityStatus {
+    Active,           // Entity is in good standing
+    Dissolved,        // Entity has been dissolved
+    Inactive,         // Entity is temporarily inactive
+    Suspended,        // Entity is under suspension
+    Bankrupt,         // Entity has declared bankruptcy
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct EntityStatusCache {
+    pub status: LegalEntityStatus,
+    pub last_updated: u64,
+    pub source: Address, // Legal Oracle that provided this status
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct LegalEntityDissolutionEvent {
+    pub entity_address: Address,
+    pub dissolution_timestamp: u64,
+    pub reported_by: Address, // Legal Oracle address
+    pub affected_grants: Vec<u64>, // List of grant IDs that were paused
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct Grant {
@@ -533,6 +568,11 @@ enum DataKey {
     GrantMilestones(u64), // Maps grant_id to list of milestone claim IDs
     NextMilestoneClaimId, // Next available milestone claim ID
     NextChallengeId, // Next available challenge ID
+    // Legal Entity Monitor keys
+    LegalOracleContract, // Address of the Legal Oracle contract
+    EntityStatus(Address), // Maps entity address to its legal status
+    EntityStatusCache(Address), // Maps entity address to cached status + timestamp
+    DissolvedEntities, // List of dissolved entity addresses
 }
 
 #[contracterror]
@@ -602,6 +642,13 @@ pub enum Error {
     InsufficientMilestoneFunds = 54,
     MilestoneNotClaimed = 55,
     MilestoneAlreadyChallenged = 56,
+    // Legal Entity Monitor errors
+    LegalOracleNotSet = 57,
+    InvalidLegalOracle = 58,
+    EntityStatusCacheExpired = 59,
+    EntityAlreadyDissolved = 60,
+    EntityNotDissolved = 61,
+    UnauthorizedLegalOracle = 62,
 }
 
 // --- Internal Helpers ---
@@ -839,6 +886,53 @@ fn read_vote(env: &Env, proposal_id: u64, voter: &Address) -> Option<bool> {
 
 fn write_vote(env: &Env, proposal_id: u64, voter: &Address, vote: bool) {
     env.storage().instance().set(&DataKey::ProposalVotes(proposal_id, voter.clone()), &vote);
+}
+
+// Legal Entity Monitor Helper Functions
+fn read_legal_oracle_contract(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::LegalOracleContract).ok_or(Error::LegalOracleNotSet)
+}
+
+fn write_legal_oracle_contract(env: &Env, oracle_address: &Address) {
+    env.storage().instance().set(&DataKey::LegalOracleContract, oracle_address);
+}
+
+fn read_entity_status(env: &Env, entity_address: &Address) -> Result<LegalEntityStatus, Error> {
+    env.storage().instance().get(&DataKey::EntityStatus(entity_address.clone())).ok_or(Error::EntityNotDissolved)
+}
+
+fn write_entity_status(env: &Env, entity_address: &Address, status: LegalEntityStatus) {
+    env.storage().instance().set(&DataKey::EntityStatus(entity_address.clone()), &status);
+}
+
+fn read_entity_status_cache(env: &Env, entity_address: &Address) -> Result<EntityStatusCache, Error> {
+    env.storage().instance().get(&DataKey::EntityStatusCache(entity_address.clone())).ok_or(Error::EntityStatusCacheExpired)
+}
+
+fn write_entity_status_cache(env: &Env, entity_address: &Address, cache: &EntityStatusCache) {
+    env.storage().instance().set(&DataKey::EntityStatusCache(entity_address.clone()), cache);
+}
+
+fn read_dissolved_entities(env: &Env) -> Vec<Address> {
+    env.storage().instance().get(&DataKey::DissolvedEntities).unwrap_or_else(|| Vec::new(env))
+}
+
+fn write_dissolved_entities(env: &Env, entities: &Vec<Address>) {
+    env.storage().instance().set(&DataKey::DissolvedEntities, entities);
+}
+
+fn is_legal_oracle_authorized(env: &Env, oracle_address: &Address) -> Result<bool, Error> {
+    let authorized_oracle = read_legal_oracle_contract(env)?;
+    Ok(*oracle_address == authorized_oracle)
+}
+
+fn is_entity_status_cache_valid(env: &Env, entity_address: &Address) -> bool {
+    if let Ok(cache) = read_entity_status_cache(env, entity_address) {
+        let now = env.ledger().timestamp();
+        cache.last_updated + ENTITY_STATUS_CACHE_DURATION > now
+    } else {
+        false
+    }
 }
 
 fn generate_evidence_hash(evidence: &String) -> [u8; 32] {
@@ -3250,6 +3344,209 @@ pub mod grant {
         let _grant = read_grant(&env, grant_id)?; // Verify grant exists
         Ok(read_grant_milestones(&env, grant_id))
     }
+
+    // === Legal Entity Monitor Functions ===
+
+    /// Set the Legal Oracle contract address (admin only)
+    /// 
+    /// This function configures the authorized Legal Oracle that can report
+    /// entity dissolution events. Only the admin can set this address.
+    pub fn set_legal_oracle_contract(env: Env, legal_oracle: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        write_legal_oracle_contract(&env, &legal_oracle);
+        
+        env.events().publish(
+            (symbol_short!("legal_oracle_set"),),
+            (legal_oracle),
+        );
+        
+        Ok(())
+    }
+
+    /// Report entity dissolution (Legal Oracle only)
+    /// 
+    /// When a Legal Oracle reports that an entity has been dissolved,
+    /// this function automatically pauses all active streams to that entity
+    /// and records the dissolution event.
+    pub fn report_entity_dissolution(
+        env: Env,
+        entity_address: Address,
+        dissolution_timestamp: u64,
+        evidence: String,
+    ) -> Result<LegalEntityDissolutionEvent, Error> {
+        // Verify caller is authorized Legal Oracle
+        let caller = env.current_contract_address();
+        if !is_legal_oracle_authorized(&env, &caller)? {
+            return Err(Error::UnauthorizedLegalOracle);
+        }
+
+        // Check if entity is already marked as dissolved
+        if let Ok(LegalEntityStatus::Dissolved) = read_entity_status(&env, &entity_address) {
+            return Err(Error::EntityAlreadyDissolved);
+        }
+
+        // Update entity status
+        write_entity_status(&env, &entity_address, LegalEntityStatus::Dissolved);
+
+        // Update status cache
+        let cache = EntityStatusCache {
+            status: LegalEntityStatus::Dissolved,
+            last_updated: env.ledger().timestamp(),
+            source: caller,
+        };
+        write_entity_status_cache(&env, &entity_address, &cache);
+
+        // Add to dissolved entities list
+        let mut dissolved_entities = read_dissolved_entities(&env);
+        dissolved_entities.push_back(entity_address.clone());
+        write_dissolved_entities(&env, &dissolved_entities);
+
+        // Find and pause all active grants for this entity
+        let mut affected_grants = Vec::new(&env);
+        let grant_ids = read_grant_ids(&env);
+        
+        for grant_id in grant_ids.iter() {
+            if let Ok(mut grant) = read_grant(&env, grant_id) {
+                // Check if grant recipient matches the dissolved entity
+                if grant.recipient == entity_address {
+                    // Only pause active grants
+                    if grant.status == GrantStatus::Active {
+                        grant.status = GrantStatus::Paused;
+                        write_grant(&env, grant_id, &grant);
+                        affected_grants.push_back(grant_id);
+                        
+                        // Emit pause event
+                        env.events().publish(
+                            (symbol_short!("auto_paused"),),
+                            (grant_id, entity_address.clone(), dissolution_timestamp),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Create dissolution event record
+        let dissolution_event = LegalEntityDissolutionEvent {
+            entity_address: entity_address.clone(),
+            dissolution_timestamp,
+            reported_by: caller,
+            affected_grants: affected_grants.clone(),
+        };
+
+        // Emit dissolution event
+        env.events().publish(
+            (symbol_short!("entity_dissolved"),),
+            (
+                entity_address,
+                dissolution_timestamp,
+                caller,
+                affected_grants.len(),
+            ),
+        );
+
+        Ok(dissolution_event)
+    }
+
+    /// Get entity status (public function)
+    /// 
+    /// Returns the current legal status of an entity.
+    /// Uses cached status if available and valid.
+    pub fn get_entity_status(env: Env, entity_address: Address) -> Result<LegalEntityStatus, Error> {
+        // Check cache first
+        if is_entity_status_cache_valid(&env, &entity_address) {
+            let cache = read_entity_status_cache(&env, &entity_address)?;
+            return Ok(cache.status);
+        }
+
+        // Return stored status
+        read_entity_status(&env, &entity_address)
+    }
+
+    /// Get all dissolved entities
+    /// 
+    /// Returns a list of all entities that have been marked as dissolved.
+    pub fn get_dissolved_entities(env: Env) -> Vec<Address> {
+        read_dissolved_entities(&env)
+    }
+
+    /// Check if an entity is dissolved
+    /// 
+    /// Convenience function to check if an entity has been dissolved.
+    pub fn is_entity_dissolved(env: Env, entity_address: Address) -> bool {
+        if let Ok(status) = read_entity_status(&env, &entity_address) {
+            status == LegalEntityStatus::Dissolved
+        } else {
+            false
+        }
+    }
+
+    /// Get Legal Oracle contract address
+    /// 
+    /// Returns the address of the authorized Legal Oracle contract.
+    pub fn get_legal_oracle_contract(env: Env) -> Result<Address, Error> {
+        read_legal_oracle_contract(&env)
+    }
+
+    /// Update entity status (Legal Oracle only)
+    /// 
+    /// Allows the Legal Oracle to update an entity's status to any state.
+    /// This can be used for status corrections or temporary suspensions.
+    pub fn update_entity_status(
+        env: Env,
+        entity_address: Address,
+        new_status: LegalEntityStatus,
+        evidence: String,
+    ) -> Result<(), Error> {
+        // Verify caller is authorized Legal Oracle
+        let caller = env.current_contract_address();
+        if !is_legal_oracle_authorized(&env, &caller)? {
+            return Err(Error::UnauthorizedLegalOracle);
+        }
+
+        // Update entity status
+        write_entity_status(&env, &entity_address, new_status);
+
+        // Update status cache
+        let cache = EntityStatusCache {
+            status: new_status,
+            last_updated: env.ledger().timestamp(),
+            source: caller,
+        };
+        write_entity_status_cache(&env, &entity_address, &cache);
+
+        // Update dissolved entities list if needed
+        if new_status == LegalEntityStatus::Dissolved {
+            let mut dissolved_entities = read_dissolved_entities(&env);
+            if !dissolved_entities.contains(&entity_address) {
+                dissolved_entities.push_back(entity_address.clone());
+                write_dissolved_entities(&env, &dissolved_entities);
+            }
+        } else {
+            // Remove from dissolved list if status is no longer dissolved
+            let mut dissolved_entities = read_dissolved_entities(&env);
+            let mut new_list = Vec::new(&env);
+            for entity in dissolved_entities.iter() {
+                if entity != entity_address {
+                    new_list.push_back(entity);
+                }
+            }
+            write_dissolved_entities(&env, &new_list);
+        }
+
+        // Emit status update event
+        env.events().publish(
+            (symbol_short!("entity_status_updated"),),
+            (
+                entity_address,
+                new_status,
+                caller,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        Ok(())
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -3273,6 +3570,8 @@ mod test_lease;
 mod test_add_funds;
 #[cfg(test)]
 mod test_financial_snapshot;
+#[cfg(test)]
+mod test_legal_entity_monitor;
 #[cfg(test)]
 mod test_slashing;
 mod test_inflation;
